@@ -1,0 +1,226 @@
+const { Telegraf } = require('telegraf');
+const { Connection, PublicKey, Keypair, LAMPORTS_PER_SOL, SystemProgram, Transaction } = require('@solana/web3.js');
+const sqlite3 = require('sqlite3').verbose();
+const config = require('./config'); // Ensure you configure the config file with your bot token and constants
+
+// Initialize Telegram bot and Solana connection
+const bot = new Telegraf(config.TELEGRAM_TOKEN);
+const connection = new Connection('https://api.mainnet-beta.solana.com');
+const db = new sqlite3.Database('./users.db');
+
+// Initialize database
+db.serialize(() => {
+    db.run(`CREATE TABLE IF NOT EXISTS users (id INTEGER PRIMARY KEY, publicKey TEXT, secretKey TEXT, referralCode TEXT)`);
+    db.run(`CREATE TABLE IF NOT EXISTS deposits (userId INTEGER, amount REAL)`);
+    db.run(`CREATE TABLE IF NOT EXISTS referrals (userId INTEGER, referralCode TEXT, referredUserId INTEGER)`);
+});
+
+// Create a new Solana wallet
+bot.command('create_wallet', async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const keypair = Keypair.generate();
+    const publicKey = keypair.publicKey.toString();
+    const secretKey = keypair.secretKey.toString();
+
+    db.run("INSERT INTO users (id, publicKey, secretKey) VALUES (?, ?, ?)", [chatId, publicKey, secretKey], (err) => {
+        if (err) {
+            return ctx.reply("Error creating wallet.");
+        }
+        ctx.reply(`Your new Solana wallet has been created:\nAddress: ${publicKey}\nPrivate Key: ${secretKey}`);
+    });
+});
+
+// Import an existing Solana wallet
+bot.command('import_wallet', async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const secretKey = ctx.message.text.split(' ')[1].split(',').map(s => parseInt(s));
+
+    try {
+        const keypair = Keypair.fromSecretKey(Uint8Array.from(secretKey));
+        const publicKey = keypair.publicKey.toString();
+
+        db.run("INSERT INTO users (id, publicKey, secretKey) VALUES (?, ?, ?)", [chatId, publicKey, secretKey], (err) => {
+            if (err) {
+                return ctx.reply("Error importing wallet.");
+            }
+            ctx.reply(`Your wallet has been imported:\nAddress: ${publicKey}`);
+        });
+    } catch (err) {
+        ctx.reply("Invalid private key.");
+    }
+});
+
+// Delete a wallet
+bot.command('delete_wallet', async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    db.run("DELETE FROM users WHERE id = ?", [chatId], (err) => {
+        if (err) {
+            return ctx.reply("Error deleting wallet.");
+        }
+        ctx.reply("Your wallet has been deleted.");
+    });
+});
+
+// Provide a deposit address
+bot.command('deposit', (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const depositAddress = config.DEPOSIT_ADDRESS;
+    ctx.reply(`Please deposit a minimum of 1 SOL to this address to start using the copy trading service:\n${depositAddress}`);
+});
+
+// Check if the user has deposited 1 SOL
+function checkDeposit(chatId, callback) {
+    db.get("SELECT * FROM deposits WHERE userId = ?", [chatId], (err, row) => {
+        if (row && row.amount >= 1) {
+            callback(true);
+        } else {
+            callback(false);
+        }
+    });
+}
+
+// Start copy trading
+bot.command('start_copy_trading', (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const targetWallet = ctx.message.text.split(' ')[1];
+
+    checkDeposit(chatId, (isDeposited) => {
+        if (!isDeposited) {
+            return ctx.reply("You need to deposit at least 1 SOL to start copy trading.");
+        }
+
+        db.get("SELECT * FROM users WHERE id = ?", [chatId], (err, user) => {
+            if (user) {
+                startCopyingTransactions(user.publicKey, targetWallet);
+                ctx.reply(`Started copying transactions from wallet: ${targetWallet}`);
+            } else {
+                ctx.reply("Please create or import a wallet first.");
+            }
+        });
+    });
+});
+
+// Start copying transactions
+async function startCopyingTransactions(userWallet, targetWallet) {
+    // Add logic for subscribing and copying transactions from targetWallet to userWallet
+    // Solana's Transaction tracking can be done here
+    console.log(`Started copy trading from ${targetWallet} to ${userWallet}`);
+}
+
+// Send Solana transaction
+async function sendTransaction(fromWallet, amount, toWallet) {
+    const transaction = new Transaction().add(
+        SystemProgram.transfer({
+            fromPubkey: new PublicKey(fromWallet),
+            toPubkey: new PublicKey(toWallet),
+            lamports: amount * LAMPORTS_PER_SOL,
+        })
+    );
+
+    // Sign and send the transaction
+    const signature = await connection.sendTransaction(transaction, [fromWallet]);
+    console.log('Transaction successful with signature:', signature);
+    return signature;
+}
+
+// Referral command
+bot.command('referral', (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const referralLink = `https://t.me/lynexisbot?start=${chatId}`;
+
+    db.run("INSERT INTO referrals (userId, referralCode) VALUES (?, ?)", [chatId, referralLink], function (err) {
+        if (err) return ctx.reply("Error generating referral link.");
+        ctx.reply(`Here is your referral link: ${referralLink}`);
+    });
+});
+
+// Calculate transaction fees
+function calculateFee(referral) {
+    if (referral) {
+        return {
+            userFee: 0.04, // 4% for you
+            referrerFee: 0.01 // 1% for referrer
+        };
+    }
+    return {
+        userFee: 0.05, // 5% for you if no referral
+        referrerFee: 0
+    };
+}
+
+// Buy tokens command
+bot.command('buy', async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const [_, tokenAddress, solAmount] = ctx.message.text.split(' ');
+
+    checkDeposit(chatId, async (isDeposited) => {
+        if (!isDeposited) {
+            return ctx.reply("You need to deposit at least 1 SOL to use this feature.");
+        }
+
+        const fee = calculateFee(users[chatId]?.referral);
+        const amountAfterFees = solAmount - fee.userFee;
+
+        await sendTransaction(users[chatId].publicKey, amountAfterFees, tokenAddress);
+        ctx.reply(`You have successfully bought ${amountAfterFees} worth of ${tokenAddress}. Transaction fees applied.`);
+    });
+});
+
+// Sell tokens command
+bot.command('sell', async (ctx) => {
+    const chatId = ctx.message.chat.id;
+    const [_, tokenAddress, solAmount] = ctx.message.text.split(' ');
+
+    db.get("SELECT * FROM users WHERE id = ?", [chatId], async (err, user) => {
+        if (!user || !user.tokens[tokenAddress]) {
+            return ctx.reply("You don't own any tokens of this type.");
+        }
+
+        const tokenBalance = user.tokens[tokenAddress];
+        const amountToSell = Math.min(solAmount, tokenBalance);
+        const fee = calculateFee(user.referral);
+        const amountAfterFees = amountToSell - fee.userFee;
+
+        await sendTransaction(user.publicKey, amountAfterFees, config.DEPOSIT_ADDRESS);
+        ctx.reply(`You have successfully sold ${amountAfterFees} ${tokenAddress}. Transaction fees applied.`);
+    });
+});
+
+// View portfolio command
+bot.command('portfolio', (ctx) => {
+    const chatId = ctx.message.chat.id;
+
+    db.get("SELECT * FROM users WHERE id = ?", [chatId], (err, user) => {
+        if (!user || !user.tokens) {
+            return ctx.reply("You don't own any tokens.");
+        }
+
+        let portfolioMessage = '📊 Your portfolio:\n';
+        for (const [token, amount] of Object.entries(user.tokens)) {
+            portfolioMessage += `🔹 ${token}: ${amount} tokens\n`;
+        }
+
+        ctx.reply(portfolioMessage);
+    });
+});
+
+// View user stats
+bot.command('stats', (ctx) => {
+    const chatId = ctx.message.chat.id;
+
+    db.get("SELECT * FROM users WHERE id = ?", [chatId], (err, user) => {
+        if (!user) {
+            return ctx.reply("You have no stats yet.");
+        }
+
+        const statsMessage = `📊 Total trades: ${user.totalTrades || 0}\n💰 Total profit: ${user.totalProfit || 0} SOL`;
+        ctx.reply(statsMessage);
+    });
+});
+
+// Launch the bot
+bot.launch().then(() => {
+    console.log("Bot is running...");
+}).catch((error) => {
+    console.error("Error launching bot:", error);
+});
